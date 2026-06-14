@@ -10,7 +10,7 @@ Shader "Custom/S_CheckerGround"
     SubShader
     {
         Tags { "RenderType" = "Opaque" "RenderPipeline" = "UniversalPipeline" }
-
+        
         Pass
         {
             HLSLPROGRAM

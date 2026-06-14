@@ -72,8 +72,12 @@ MonoBehaviour:
   settings:
     renderScale: 0.5
     material: {fileID: 2100000, guid: 4c3306a42d9b2aa4f9f643dba3e87385, type: 2}
-    debugMode: 0
-    motionScale: 16
+    renderPassEvent: 300
+    presentMode: 1
+    enableHistory: 1
+    historyBlend: 0.8
+    debugMode: 2
+    motionScale: 100
 --- !u!114 &7833122117494664109
 MonoBehaviour:
   m_ObjectHideFlags: 0

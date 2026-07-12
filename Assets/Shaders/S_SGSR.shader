@@ -77,6 +77,7 @@ Shader "Custom/S_SGSR"
 
             float _HistoryBlend;
             float _HistoryValid;
+            float2 _SGSRJitterDelta;
             
             half4 frag(Varyings input) : SV_Target
             {
@@ -88,7 +89,7 @@ Shader "Custom/S_SGSR"
                     return current;
 
                 float2 motion = SAMPLE_TEXTURE2D_X(_MotionVectorTexture, sampler_PointClamp, uv).xy;
-                float2 historyUV = uv - motion;
+                float2 historyUV = uv - motion - _SGSRJitterDelta;
 
                 UNITY_BRANCH
                 if (any(historyUV < 0.0) || any(historyUV > 1.0))

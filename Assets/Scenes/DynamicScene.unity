@@ -508,9 +508,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d92181e7bb734b57be3ee533317c02e2, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::CameraJitter
-  enableJitter: 1
-  jitterScale: 1
-  jitterPhaseCount: 8
 --- !u!1 &1800343633
 GameObject:
   m_ObjectHideFlags: 0

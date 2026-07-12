@@ -59,9 +59,8 @@ public class CameraJitter : MonoBehaviour
             return;
         }
 
-        float renderScale = Mathf.Clamp(SGSR.CurrentRenderScale, 0.1f, 1.0f);
-        int renderWidth = Mathf.Max(1, Mathf.RoundToInt(_camera.pixelWidth * renderScale));
-        int renderHeight = Mathf.Max(1, Mathf.RoundToInt(_camera.pixelHeight * renderScale));
+        int renderWidth = Mathf.Max(1, _camera.pixelWidth);
+        int renderHeight = Mathf.Max(1, _camera.pixelHeight);
 
         _nonJitteredProjection = _camera.projectionMatrix;
 

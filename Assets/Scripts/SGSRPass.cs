@@ -15,6 +15,7 @@ public class SGSRPass : ScriptableRenderPass
     private static readonly int MotionScaleId = Shader.PropertyToID("_MotionScale");
     private static readonly int HistoryBlendId = Shader.PropertyToID("_HistoryBlend");
     private static readonly int HistoryValidId = Shader.PropertyToID("_HistoryValid");
+    private static readonly int JitterDeltaId = Shader.PropertyToID("_SGSRJitterDelta");
 
     public enum PresentMode
     {
@@ -70,6 +71,7 @@ public class SGSRPass : ScriptableRenderPass
         public float motionScale;
         public float historyBlend;
         public bool historyValid;
+        public Vector2 jitterDelta;
     }
 
     // This static method is passed as the RenderFunc delegate to the RenderGraph render pass.
@@ -80,6 +82,7 @@ public class SGSRPass : ScriptableRenderPass
         data.material.SetFloat(MotionScaleId, data.motionScale);
         data.material.SetFloat(HistoryBlendId, data.historyBlend);
         data.material.SetFloat(HistoryValidId, data.historyValid ? 1.0f : 0.0f);
+        data.material.SetVector(JitterDeltaId, new Vector4(data.jitterDelta.x, data.jitterDelta.y, 0.0f, 0.0f));
 
         if (data.depth.IsValid())
             data.material.SetTexture(SgsrDepthTextureId, data.depth);
@@ -145,6 +148,7 @@ public class SGSRPass : ScriptableRenderPass
         TextureHandle motionTexture = resourceData.motionVectorColor.IsValid()
             ? resourceData.motionVectorColor
             : renderGraph.defaultResources.blackTexture;
+        Vector2 jitterDelta = GetJitterDelta(cameraData.camera);
 
         using (var builder = renderGraph.AddRasterRenderPass<PassData>(
                    "SGSR Debug Low Resolution Pass",
@@ -160,6 +164,7 @@ public class SGSRPass : ScriptableRenderPass
             passData.motionScale = settings.motionScale;
             passData.historyBlend = 0.0f;
             passData.historyValid = false;
+            passData.jitterDelta = Vector2.zero;
             
             builder.UseTexture(cameraColor);
             builder.UseTexture(depthTexture);
@@ -182,6 +187,7 @@ public class SGSRPass : ScriptableRenderPass
             passData.motionScale = settings.motionScale;
             passData.historyBlend = Mathf.Clamp01(settings.historyBlend);
             passData.historyValid = historyReady && historyValid;
+            passData.jitterDelta = passData.historyValid ? jitterDelta : Vector2.zero;
             
             builder.UseTexture(lowResTexture);
             builder.UseTexture(depthTexture);
@@ -237,5 +243,17 @@ public class SGSRPass : ScriptableRenderPass
         }
 
         return historyA != null && historyB != null;
+    }
+
+    private static Vector2 GetJitterDelta(Camera camera)
+    {
+        if (camera == null)
+            return Vector2.zero;
+
+        CameraJitter jitter = camera.GetComponent<CameraJitter>();
+        if (jitter == null || !jitter.enableJitter)
+            return Vector2.zero;
+
+        return jitter.CurrentJitterUV - jitter.PreviousJitterUV;
     }
 }

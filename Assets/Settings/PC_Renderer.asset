@@ -71,12 +71,11 @@ MonoBehaviour:
   settings:
     renderScale: 1
     material: {fileID: 2100000, guid: 4c3306a42d9b2aa4f9f643dba3e87385, type: 2}
-    renderPassEvent: 300
-    presentMode: 1
     enableHistory: 1
     enableJitter: 1
     jitterScale: 1
     jitterPhaseCount: 8
-    historyBlend: 0.8
-    debugMode: 1
-    motionScale: 100
+    minLerpContribution: 0.3
+    historyDepthThreshold: 0.02
+    cameraCutDistance: 5
+    cameraCutAngle: 45

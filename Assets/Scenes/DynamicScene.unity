@@ -131,6 +131,7 @@ GameObject:
   - component: {fileID: 275933342}
   - component: {fileID: 275933341}
   - component: {fileID: 275933340}
+  - component: {fileID: 275933343}
   m_Layer: 0
   m_Name: MovingSphere
   m_TagString: Untagged
@@ -231,6 +232,21 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 275933338}
   m_Mesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &275933343
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 275933338}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ac8bd30d54d84622b5a08f756416ed84, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  useTransparentMaterial: 0
+  opaqueMaterial: {fileID: 2100000, guid: 105b7bc714f847ca95ae9ca61e4b0f31, type: 2}
+  transparentMaterial: {fileID: 2100000, guid: 1de27d4e5acd14946ac05c795ec575e7, type: 2}
 --- !u!1 &1119258488
 GameObject:
   m_ObjectHideFlags: 0

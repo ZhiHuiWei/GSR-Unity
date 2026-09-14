@@ -9,9 +9,11 @@ public class SGSR : ScriptableRendererFeature
     private SGSRPass m_ScriptablePass;
     private CameraJitterRenderPass m_ApplyJitterPass;
     private CameraJitterRenderPass m_RestoreJitterPass;
+    private bool warnedUnsupportedConfiguration;
 
     public override void Create()
     {
+        m_ScriptablePass?.Dispose();
         if (settings == null)
             return;
         
@@ -21,24 +23,52 @@ public class SGSR : ScriptableRendererFeature
 
         m_ScriptablePass = new SGSRPass(settings)
         {
-            renderPassEvent = settings.renderPassEvent
+            renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing
         };
 
-        m_ScriptablePass.ConfigureInput(ScriptableRenderPassInput.Motion | ScriptableRenderPassInput.Depth);
     }
 
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
     {
-        if (settings == null || settings.material == null)
+        if (settings == null || settings.material == null || m_ScriptablePass == null)
             return;
 
+        // Preview/reflection cameras and overlay cameras do not own a temporal scene history.
+        if (renderingData.cameraData.cameraType != CameraType.Game ||
+            renderingData.cameraData.renderType != CameraRenderType.Base ||
+            renderingData.cameraData.xr.enabled || !renderingData.cameraData.resolveFinalTarget)
+            return;
+
+        // URP has already chosen its built-in scaling/TAA path at this point.
+        // Keep that path at native resolution; SGSR owns the scene scale below.
+        if (!Mathf.Approximately(UniversalRenderPipeline.asset.renderScale, 1.0f) ||
+            (UniversalRenderPipeline.asset.upscalingFilter != UpscalingFilterSelection.Auto &&
+             UniversalRenderPipeline.asset.upscalingFilter != UpscalingFilterSelection.Linear &&
+             UniversalRenderPipeline.asset.upscalingFilter != UpscalingFilterSelection.Point) ||
+            renderingData.cameraData.antialiasing == AntialiasingMode.TemporalAntiAliasing ||
+            renderingData.cameraData.cameraTargetDescriptor.useDynamicScale)
+        {
+            if (!warnedUnsupportedConfiguration)
+                Debug.LogWarning("SGSR requires URP Render Scale = 1, Upscaling Filter = Automatic/Bilinear/Nearest-Neighbor, TAA off, and hardware dynamic resolution off. Use SGSR Render Scale to set scene resolution.", this);
+            warnedUnsupportedConfiguration = true;
+            m_ScriptablePass.ResetHistory(renderingData.cameraData.camera);
+            return;
+        }
+        warnedUnsupportedConfiguration = false;
+
         CurrentRenderScale = Mathf.Clamp(settings.renderScale, 0.1f, 1.0f);
+        // AddRenderPasses runs before CreateRenderGraphCameraRenderTargets.
+        // This changes rasterization itself, including depth and motion targets.
+        m_ScriptablePass.PrepareCamera(ref renderingData.cameraData);
         renderer.EnqueuePass(m_ApplyJitterPass);
-        m_ScriptablePass.renderPassEvent = settings.renderPassEvent;
+        // Depth and object/camera motion must have been generated; also include transparents.
+        m_ScriptablePass.renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
 
         renderer.EnqueuePass(m_ScriptablePass);
         renderer.EnqueuePass(m_RestoreJitterPass);
     }
+
+    public void ResetHistory(Camera camera = null) => m_ScriptablePass?.ResetHistory(camera);
 
     protected override void Dispose(bool disposing)
     {

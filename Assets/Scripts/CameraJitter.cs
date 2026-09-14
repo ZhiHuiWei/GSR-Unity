@@ -27,7 +27,7 @@ public class CameraJitter : MonoBehaviour
         ResetJitter();
     }
 
-    public bool UpdateJitter(SGSRPass.SGSRSettings settings)
+    public bool UpdateJitter(SGSRPass.SGSRSettings settings, int targetWidth, int targetHeight)
     {
         if (_camera == null)
             _camera = GetComponent<Camera>();
@@ -38,8 +38,10 @@ public class CameraJitter : MonoBehaviour
             return false;
         }
 
-        int renderWidth = Mathf.Max(1, _camera.pixelWidth);
-        int renderHeight = Mathf.Max(1, _camera.pixelHeight);
+        // The camera descriptor is already at the actual scene resolution.
+        // Applying settings.renderScale here again would double the jitter.
+        int renderWidth = Mathf.Max(1, targetWidth);
+        int renderHeight = Mathf.Max(1, targetHeight);
 
         Vector2 jitter = GetHaltonJitter(_frameIndex % Mathf.Max(1, settings.jitterPhaseCount)) * settings.jitterScale;
         PreviousJitterPixels = CurrentJitterPixels;
@@ -62,8 +64,9 @@ public class CameraJitter : MonoBehaviour
     public Matrix4x4 GetJitteredProjectionMatrix(Matrix4x4 nonJitteredProjection)
     {
         Matrix4x4 projection = nonJitteredProjection;
-        projection.m02 += CurrentJitterUV.x * 2.0f;
-        projection.m12 += CurrentJitterUV.y * 2.0f;
+        // Translate in clip space; works for both perspective and orthographic cameras.
+        projection.SetRow(0, projection.GetRow(0) + CurrentJitterUV.x * 2.0f * projection.GetRow(3));
+        projection.SetRow(1, projection.GetRow(1) + CurrentJitterUV.y * 2.0f * projection.GetRow(3));
 
         return projection;
     }

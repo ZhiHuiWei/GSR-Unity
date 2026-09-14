@@ -5,6 +5,9 @@ using UnityEngine.Rendering.Universal;
 
 public sealed class CameraJitterRenderPass : ScriptableRenderPass
 {
+    private static readonly int InverseViewId = Shader.PropertyToID("unity_MatrixInvV");
+    private static readonly int InverseProjectionId = Shader.PropertyToID("unity_MatrixInvP");
+    private static readonly int InverseViewProjectionId = Shader.PropertyToID("unity_MatrixInvVP");
     private readonly bool _isApplyPass;
     private readonly SGSRPass.SGSRSettings _settings;
 
@@ -12,7 +15,9 @@ public sealed class CameraJitterRenderPass : ScriptableRenderPass
     {
         public Matrix4x4 viewMatrix;
         public Matrix4x4 projectionMatrix;
-        public Matrix4x4 gpuProjectionMatrix;
+        public Matrix4x4 inverseViewMatrix;
+        public Matrix4x4 inverseProjectionMatrix;
+        public Matrix4x4 inverseViewProjectionMatrix;
     }
 
     public CameraJitterRenderPass(RenderPassEvent evt, bool isApplyPass, SGSRPass.SGSRSettings settings)
@@ -22,33 +27,19 @@ public sealed class CameraJitterRenderPass : ScriptableRenderPass
         this._settings = settings;
     }
 
-    public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
-    {
-        if (!TryGetMatrices(
-                renderingData.cameraData.camera,
-                renderingData.cameraData.IsCameraProjectionMatrixFlipped(),
-                out Matrix4x4 viewMatrix,
-                out Matrix4x4 projectionMatrix,
-                out Matrix4x4 gpuProjectionMatrix))
-            return;
-
-        CommandBuffer cmd = CommandBufferPool.Get(_isApplyPass ? "Apply Camera Jitter" : "Restore Camera Jitter");
-        
-        // 管线上和 shader 内用的 matrix 不来自同一个地方，所以需要 set 两次
-        cmd.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
-        RenderingUtils.SetViewAndProjectionMatrices(cmd, viewMatrix, gpuProjectionMatrix, true);
-        
-        context.ExecuteCommandBuffer(cmd);
-        CommandBufferPool.Release(cmd);
-    }
-
     public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
     {
         UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
+        if (_isApplyPass)
+        {
+            cameraData.scaledWidth = cameraData.cameraTargetDescriptor.width;
+            cameraData.scaledHeight = cameraData.cameraTargetDescriptor.height;
+        }
 
         if (!TryGetMatrices(
-                cameraData.camera,
-                cameraData.IsCameraProjectionMatrixFlipped(),
+                cameraData,
+                cameraData.cameraTargetDescriptor.width,
+                cameraData.cameraTargetDescriptor.height,
                 out Matrix4x4 viewMatrix,
                 out Matrix4x4 projectionMatrix,
                 out Matrix4x4 gpuProjectionMatrix))
@@ -60,21 +51,30 @@ public sealed class CameraJitterRenderPass : ScriptableRenderPass
         {
             passData.viewMatrix = viewMatrix;
             passData.projectionMatrix = projectionMatrix;
-            passData.gpuProjectionMatrix = gpuProjectionMatrix;
+            passData.inverseViewMatrix = viewMatrix.inverse;
+            passData.inverseProjectionMatrix = gpuProjectionMatrix.inverse;
+            passData.inverseViewProjectionMatrix = passData.inverseViewMatrix * passData.inverseProjectionMatrix;
 
             builder.AllowGlobalStateModification(true);
             builder.AllowPassCulling(false);    // 防止 RendereGraph 认为 Pass 无用删除
             builder.SetRenderFunc(static (PassData data, RasterGraphContext context) =>
             {
                 context.cmd.SetViewProjectionMatrices(data.viewMatrix, data.projectionMatrix);
-                RenderingUtils.SetViewAndProjectionMatrices(context.cmd, data.viewMatrix, data.gpuProjectionMatrix, true);
+                // Match ScriptableRenderer.SetCameraMatrices: Unity converts the
+                // forward projection for the active render target and winding.
+                // Overwriting unity_MatrixP/VP with a pre-flipped GPU matrix here
+                // breaks that contract and can cull front-facing geometry.
+                context.cmd.SetGlobalMatrix(InverseViewId, data.inverseViewMatrix);
+                context.cmd.SetGlobalMatrix(InverseProjectionId, data.inverseProjectionMatrix);
+                context.cmd.SetGlobalMatrix(InverseViewProjectionId, data.inverseViewProjectionMatrix);
             });
         }
     }
 
     private bool TryGetMatrices(
-        Camera camera,
-        bool projectionMatrixFlipped,
+        UniversalCameraData cameraData,
+        int targetWidth,
+        int targetHeight,
         out Matrix4x4 viewMatrix,
         out Matrix4x4 projectionMatrix,
         out Matrix4x4 gpuProjectionMatrix)
@@ -83,23 +83,25 @@ public sealed class CameraJitterRenderPass : ScriptableRenderPass
         projectionMatrix = Matrix4x4.identity;
         gpuProjectionMatrix = Matrix4x4.identity;
 
+        Camera camera = cameraData.camera;
         if (camera == null)
             return false;
 
-        Matrix4x4 nonJitteredProjection = camera.projectionMatrix;
+        // Use the same cached view/projection as URP (including its aspect setup).
+        Matrix4x4 nonJitteredProjection = cameraData.GetProjectionMatrix();
         projectionMatrix = nonJitteredProjection;
 
         if (_isApplyPass)
         {
             CameraJitter jitter = camera.GetComponent<CameraJitter>();
-            if (jitter == null || !jitter.enabled || !jitter.UpdateJitter(_settings))
+            if (jitter == null || !jitter.enabled || !jitter.UpdateJitter(_settings, targetWidth, targetHeight))
                 return false;
 
             projectionMatrix = jitter.GetJitteredProjectionMatrix(nonJitteredProjection);
         }
 
-        viewMatrix = camera.worldToCameraMatrix;
-        gpuProjectionMatrix = GL.GetGPUProjectionMatrix(projectionMatrix, projectionMatrixFlipped);
+        viewMatrix = cameraData.GetViewMatrix();
+        gpuProjectionMatrix = GL.GetGPUProjectionMatrix(projectionMatrix, true);
         return true;
     }
 }

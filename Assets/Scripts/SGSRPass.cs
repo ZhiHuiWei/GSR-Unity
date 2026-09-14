@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
@@ -7,259 +8,362 @@ using UnityEngine.Rendering.RenderGraphModule.Util;
 using UnityEngine.Rendering.Universal;
 
 public class SGSRPass : ScriptableRenderPass
-{   
-    private static readonly int SgsrDepthTextureId = Shader.PropertyToID("_SGSRDepthTexture");
-    private static readonly int SgsrHistoryTextureId = Shader.PropertyToID("_SGSRHistoryTexture");
-    private static readonly int MotionVectorTextureId = Shader.PropertyToID("_MotionVectorTexture");
-    private static readonly int DebugModeId = Shader.PropertyToID("_DebugMode");
-    private static readonly int MotionScaleId = Shader.PropertyToID("_MotionScale");
-    private static readonly int HistoryBlendId = Shader.PropertyToID("_HistoryBlend");
-    private static readonly int HistoryValidId = Shader.PropertyToID("_HistoryValid");
-    private static readonly int JitterDeltaId = Shader.PropertyToID("_SGSRJitterDelta");
-
-    public enum PresentMode
-    {
-        Normal,
-        Upsample
-    }
+{
+    private static readonly MaterialPropertyBlock DrawProperties = new();
+    private static readonly int BlitTextureId = Shader.PropertyToID("_BlitTexture");
+    private static readonly int BlitScaleBiasId = Shader.PropertyToID("_BlitScaleBias");
+    private static readonly int DepthId = Shader.PropertyToID("_SGSRDepthTexture");
+    private static readonly int MotionId = Shader.PropertyToID("_MotionVectorTexture");
+    private static readonly int MotionDepthClipId = Shader.PropertyToID("_SGSRMotionDepthClipTexture");
+    private static readonly int HistoryId = Shader.PropertyToID("_SGSRHistoryTexture");
+    private static readonly int PreviousMetadataId = Shader.PropertyToID("_SGSRPreviousMetadata");
+    private static readonly int PreviousJitterId = Shader.PropertyToID("_SGSRPreviousJitter");
+    private static readonly int InverseViewProjectionId = Shader.PropertyToID("_SGSRInverseViewProjection");
+    private static readonly int PreviousViewId = Shader.PropertyToID("_SGSRPreviousView");
+    private static readonly int DepthThresholdId = Shader.PropertyToID("_SGSRHistoryDepthThreshold");
+    private static readonly int RenderSizeId = Shader.PropertyToID("_SGSRRenderSize");
+    private static readonly int OutputSizeId = Shader.PropertyToID("_SGSROutputSize");
+    private static readonly int JitterId = Shader.PropertyToID("_SGSRJitter");
+    private static readonly int ScaleRatioId = Shader.PropertyToID("_SGSRScaleRatio");
+    private static readonly int FovId = Shader.PropertyToID("_SGSRFov");
+    private static readonly int MinLerpId = Shader.PropertyToID("_SGSRMinLerpContribution");
+    private static readonly int ResetId = Shader.PropertyToID("_SGSRReset");
+    private static readonly int NativeDepthGatherId = Shader.PropertyToID("_SGSRNativeDepthGather");
+    private static readonly int ScreenSizeId = Shader.PropertyToID("_ScreenSize");
+    private static readonly int ScaledScreenParamsId = Shader.PropertyToID("_ScaledScreenParams");
 
     [Serializable]
     public class SGSRSettings
     {
-        [Range(0.1f, 1.0f)]
-        public float renderScale = 1.0f;
-
+        [Tooltip("Actual scene resolution relative to the camera output. Keep URP Render Scale at 1; SGSR reconstructs to native output size.")]
+        [Range(0.1f, 1.0f)] public float renderScale = 1.0f;
         public Material material;
-
-        public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingOpaques;
-
-        public PresentMode presentMode = PresentMode.Upsample;
-
-        public bool enableHistory = false;
-
-        public bool enableJitter = false;
-        [Range(0, 4)]
-        public int jitterScale = 1;
-        [Range(1, 16)]
-        public int jitterPhaseCount = 8;
-
-        [Range(0.0f, 0.98f)]
-        public float historyBlend = 0.9f;
-
-        [Range(0, 2)]
-        public int debugMode = 0;
-
-        public float motionScale = 16.0f;
+        public bool enableHistory = true;
+        public bool enableJitter = true;
+        [Range(0, 4)] public int jitterScale = 1;
+        [Range(1, 32)] public int jitterPhaseCount = 8;
+        [Tooltip("History relaxation after the camera has been stationary for more than five frames.")]
+        [Range(0.0f, 1.0f)] public float minLerpContribution = 0.3f;
+        [Tooltip("Relative eye-depth tolerance for history rejection. Smaller values reject more history at occlusion boundaries.")]
+        [Range(0.001f, 0.1f)] public float historyDepthThreshold = 0.02f;
+        [Min(0.01f)] public float cameraCutDistance = 5.0f;
+        [Range(1, 180)] public float cameraCutAngle = 45.0f;
     }
-    
+
+    private sealed class CameraHistory
+    {
+        public RTHandle a, b;
+        public RTHandle metadataA, metadataB;
+        public Vector4 jitter;
+        public Matrix4x4 view;
+        public bool valid;
+        public int index, lastFrame = -1, inputWidth, inputHeight, jitterConfiguration, stillFrames;
+        public Matrix4x4 viewProjection;
+        public RenderTextureDescriptor outputDescriptor;
+        public Matrix4x4 projection;
+        public Vector3 position;
+        public Quaternion rotation;
+        public void Release()
+        {
+            a?.Release(); b?.Release(); metadataA?.Release(); metadataB?.Release();
+            a = b = metadataA = metadataB = null;
+            valid = false;
+        }
+    }
+
     private readonly SGSRSettings settings;
-    private RTHandle historyA;
-    private RTHandle historyB;
-    private bool historyValid;
-    private int historyIndex;
+    private readonly Dictionary<Camera, CameraHistory> histories = new();
+    private readonly List<Camera> expiredCameras = new();
 
     public SGSRPass(SGSRSettings settings)
     {
         this.settings = settings;
+        requiresIntermediateTexture = true;
+        ConfigureInput(ScriptableRenderPassInput.Motion | ScriptableRenderPassInput.Depth);
     }
 
-    // This class stores the data needed by the RenderGraph pass.
-    // It is passed as a parameter to the delegate function that executes the RenderGraph pass.
+    public void PrepareCamera(ref CameraData cameraData)
+    {
+        PruneHistories();
+        if (!histories.TryGetValue(cameraData.camera, out CameraHistory state))
+            histories.Add(cameraData.camera, state = new CameraHistory());
+        // Save the native descriptor before URP allocates scene attachments.
+        state.outputDescriptor = cameraData.cameraTargetDescriptor;
+        var sceneDescriptor = state.outputDescriptor;
+        float scale = Mathf.Clamp(settings.renderScale, 0.1f, 1.0f);
+        sceneDescriptor.width = Mathf.Max(1, Mathf.RoundToInt(sceneDescriptor.width * scale));
+        sceneDescriptor.height = Mathf.Max(1, Mathf.RoundToInt(sceneDescriptor.height * scale));
+        cameraData.cameraTargetDescriptor = sceneDescriptor;
+        cameraData.renderScale = scale;
+    }
+
+    private class ResolutionData
+    {
+        public Vector4 screenSize;
+    }
+
     private class PassData
     {
-        public TextureHandle source;
-        public TextureHandle depth;
-        public TextureHandle motion;
-        public TextureHandle history;
+        public TextureHandle source, depth, motion, motionDepthClip, history;
+        public TextureHandle previousMetadata;
+        public Vector4 previousJitter;
+        public Matrix4x4 inverseViewProjection, previousView;
+        public float historyDepthThreshold;
         public Material material;
         public int passIndex;
-        public int debugMode;
-        public float motionScale;
-        public float historyBlend;
-        public bool historyValid;
-        public Vector2 jitterDelta;
+        public Vector4 renderSize, outputSize, jitter, scaleRatio;
+        public float fov, minLerp, reset, nativeDepthGather;
     }
 
-    // This static method is passed as the RenderFunc delegate to the RenderGraph render pass.
-    // It is used to execute draw commands.
-    static void ExecutePass(PassData data, RasterGraphContext context)
+    private static void ExecutePass(PassData data, RasterGraphContext context)
     {
-        data.material.SetFloat(DebugModeId, data.debugMode);
-        data.material.SetFloat(MotionScaleId, data.motionScale);
-        data.material.SetFloat(HistoryBlendId, data.historyBlend);
-        data.material.SetFloat(HistoryValidId, data.historyValid ? 1.0f : 0.0f);
-        data.material.SetVector(JitterDeltaId, new Vector4(data.jitterDelta.x, data.jitterDelta.y, 0.0f, 0.0f));
-
-        if (data.depth.IsValid())
-            data.material.SetTexture(SgsrDepthTextureId, data.depth);
-        if (data.motion.IsValid())
-            data.material.SetTexture(MotionVectorTextureId, data.motion);
-        if (data.history.IsValid())
-            data.material.SetTexture(SgsrHistoryTextureId, data.history);
-        
-        Blitter.BlitTexture(
-            context.cmd, 
-            data.source,
-            new Vector4(1, 1, 0, 0),
-            data.material,
-            data.passIndex
-        );
-    }
-
-    // RecordRenderGraph is where the RenderGraph handle can be accessed, through which render passes can be added to the graph.
-    // FrameData is a context container through which URP resources can be accessed and managed.
-    public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
-    {   
-        UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
-        var cameraData = frameData.Get<UniversalCameraData>();
-        
-        if (resourceData.isActiveTargetBackBuffer)
-            return;
-        
-        float scale = Mathf.Clamp(settings.renderScale, 0.1f, 1.0f);
-        
-        RenderTextureDescriptor desc = cameraData.cameraTargetDescriptor;
-        desc.width = Mathf.Max(1, Mathf.RoundToInt(desc.width * scale));
-        desc.height = Mathf.Max(1, Mathf.RoundToInt(desc.height * scale));
-        desc.depthBufferBits = 0;
-        desc.depthStencilFormat = GraphicsFormat.None;
-        desc.msaaSamples = 1;
-
-        TextureHandle lowResTexture =
-            UniversalRenderer.CreateRenderGraphTexture(
-                renderGraph,
-                desc,
-                "_SGSR_LowResTexture",
-                false,
-                settings.presentMode == PresentMode.Upsample ? FilterMode.Bilinear : FilterMode.Point
-            );
-        
-        TextureHandle cameraColor = resourceData.activeColorTexture;
-        RenderTextureDescriptor historyDesc = cameraData.cameraTargetDescriptor;
-        historyDesc.depthBufferBits = 0;
-        historyDesc.depthStencilFormat = GraphicsFormat.None;
-        historyDesc.msaaSamples = 1;
-
-        bool historyReady = settings.enableHistory && EnsureHistory(ref historyDesc);
-        TextureHandle historyRead = historyReady
-            ? renderGraph.ImportTexture(historyIndex == 0 ? historyA : historyB)
-            : renderGraph.defaultResources.blackTexture;
-        TextureHandle historyWrite = historyReady
-            ? renderGraph.ImportTexture(historyIndex == 0 ? historyB : historyA)
-            : TextureHandle.nullHandle;
-
-        TextureHandle depthTexture = resourceData.activeDepthTexture.IsValid()
-            ? resourceData.activeDepthTexture
-            : renderGraph.defaultResources.whiteTexture;
-        TextureHandle motionTexture = resourceData.motionVectorColor.IsValid()
-            ? resourceData.motionVectorColor
-            : renderGraph.defaultResources.blackTexture;
-        Vector2 jitterDelta = GetJitterDelta(cameraData.camera, settings);
-
-        using (var builder = renderGraph.AddRasterRenderPass<PassData>(
-                   "SGSR Debug Low Resolution Pass",
-                   out var passData))
+        // Resolve RenderGraph handles only inside execution. Every input is also
+        // declared with UseTexture below so lifetimes and barriers are tracked.
+        // Command buffers retain the Material reference. A later pass (or camera)
+        // can overwrite its uniforms before the GPU draws the earlier pass.
+        // DrawProcedural snapshots this property block for each draw instead.
+        MaterialPropertyBlock material = DrawProperties;
+        material.Clear();
+        material.SetVector(RenderSizeId, data.renderSize);
+        material.SetVector(OutputSizeId, data.outputSize);
+        material.SetVector(JitterId, data.jitter);
+        material.SetVector(ScaleRatioId, data.scaleRatio);
+        material.SetFloat(FovId, data.fov);
+        material.SetFloat(MinLerpId, data.minLerp);
+        material.SetFloat(ResetId, data.reset);
+        if (data.passIndex == 0)
         {
-            passData.source = cameraColor;
-            passData.depth = depthTexture;
-            passData.motion = motionTexture;
-            passData.history = TextureHandle.nullHandle;
-            passData.material = settings.material;
-            passData.passIndex = 0;
-            passData.debugMode = settings.debugMode;
-            passData.motionScale = settings.motionScale;
-            passData.historyBlend = 0.0f;
-            passData.historyValid = false;
-            passData.jitterDelta = Vector2.zero;
-            
-            builder.UseTexture(cameraColor);
-            builder.UseTexture(depthTexture);
-            builder.UseTexture(motionTexture);
-            builder.SetRenderAttachment(lowResTexture, 0);
-            builder.SetRenderFunc((PassData data, RasterGraphContext context) => ExecutePass(data, context));
-        }
-
-        using (var builder = renderGraph.AddRasterRenderPass<PassData>(
-                   "SGSR Present Pass",
-                   out var passData))
-        {
-            passData.source = lowResTexture;
-            passData.depth = depthTexture;
-            passData.motion = motionTexture;
-            passData.history = historyRead;
-            passData.material = settings.material;
-            passData.passIndex = 1;
-            passData.debugMode = settings.debugMode;
-            passData.motionScale = settings.motionScale;
-            passData.historyBlend = Mathf.Clamp01(settings.historyBlend);
-            passData.historyValid = historyReady && historyValid;
-            passData.jitterDelta = passData.historyValid ? jitterDelta : Vector2.zero;
-            
-            builder.UseTexture(lowResTexture);
-            builder.UseTexture(depthTexture);
-            builder.UseTexture(motionTexture);
-            builder.UseTexture(historyRead);
-            builder.SetRenderAttachment(cameraColor, 0);
-            builder.SetRenderFunc((PassData data, RasterGraphContext context) => ExecutePass(data, context));
-        }
-
-        if (historyReady)
-        {
-            renderGraph.AddCopyPass(cameraColor, historyWrite, "SGSR Copy History Pass");
-            historyValid = true;
-            historyIndex = 1 - historyIndex;
+            material.SetTexture(DepthId, data.depth);
+            material.SetTexture(MotionId, data.motion);
+            material.SetFloat(NativeDepthGatherId, data.nativeDepthGather);
         }
         else
         {
-            historyValid = false;
+            material.SetTexture(MotionDepthClipId, data.motionDepthClip);
+            material.SetTexture(HistoryId, data.history);
+            material.SetTexture(DepthId, data.depth);
+            material.SetTexture(PreviousMetadataId, data.previousMetadata);
+            material.SetVector(PreviousJitterId, data.previousJitter);
+            material.SetMatrix(InverseViewProjectionId, data.inverseViewProjection);
+            material.SetMatrix(PreviousViewId, data.previousView);
+            material.SetFloat(DepthThresholdId, data.historyDepthThreshold);
+        }
+        material.SetTexture(BlitTextureId, data.source);
+        material.SetVector(BlitScaleBiasId, new Vector4(1, 1, 0, 0));
+        context.cmd.DrawProcedural(Matrix4x4.identity, data.material, data.passIndex,
+            MeshTopology.Triangles, 3, 1, material);
+    }
+
+    public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+    {
+        var resources = frameData.Get<UniversalResourceData>();
+        var cameraData = frameData.Get<UniversalCameraData>();
+        Camera camera = cameraData.camera;
+        if (settings.material == null || resources.isActiveTargetBackBuffer ||
+            !resources.cameraDepthTexture.IsValid() || !resources.motionVectorColor.IsValid())
+        {
+            ResetHistory(camera);
+            return;
+        }
+
+        if (!histories.TryGetValue(camera, out CameraHistory state))
+            return;
+
+        RenderTextureDescriptor inputDesc = cameraData.cameraTargetDescriptor;
+        RenderTextureDescriptor outputDesc = state.outputDescriptor;
+        outputDesc.depthBufferBits = 0;
+        outputDesc.depthStencilFormat = GraphicsFormat.None;
+        outputDesc.msaaSamples = 1;
+        outputDesc.bindMS = false;
+        outputDesc.useMipMap = false;
+        outputDesc.autoGenerateMips = false;
+        outputDesc.useDynamicScale = false;
+        bool reallocated = RenderingUtils.ReAllocateHandleIfNeeded(ref state.a, outputDesc, FilterMode.Bilinear,
+            TextureWrapMode.Clamp, name: "_SGSR_HistoryA");
+        reallocated |= RenderingUtils.ReAllocateHandleIfNeeded(ref state.b, outputDesc, FilterMode.Bilinear,
+            TextureWrapMode.Clamp, name: "_SGSR_HistoryB");
+
+        // Keep Convert's low-resolution metadata alongside the matching color history.
+        // Alpha stores eye depth, so no additional shader pass is needed.
+        var metadataDesc = outputDesc;
+        metadataDesc.width = inputDesc.width;
+        metadataDesc.height = inputDesc.height;
+        metadataDesc.graphicsFormat = GraphicsFormat.R32G32B32A32_SFloat;
+        reallocated |= RenderingUtils.ReAllocateHandleIfNeeded(ref state.metadataA, metadataDesc,
+            FilterMode.Point, TextureWrapMode.Clamp, name: "_SGSR_MetadataA");
+        reallocated |= RenderingUtils.ReAllocateHandleIfNeeded(ref state.metadataB, metadataDesc,
+            FilterMode.Point, TextureWrapMode.Clamp, name: "_SGSR_MetadataB");
+
+        CameraJitter jitterComponent = camera.GetComponent<CameraJitter>();
+        bool jitterEnabled = settings.enableJitter && settings.jitterScale > 0 &&
+            jitterComponent != null && jitterComponent.isActiveAndEnabled;
+        int jitterConfiguration = jitterEnabled ? settings.jitterScale * 100 + settings.jitterPhaseCount : 0;
+        bool reset = !settings.enableHistory || !state.valid || reallocated ||
+            state.lastFrame != Time.frameCount - 1 || state.inputWidth != inputDesc.width ||
+            state.inputHeight != inputDesc.height || state.jitterConfiguration != jitterConfiguration ||
+            !Approximately(state.projection, camera.projectionMatrix) ||
+            Vector3.Distance(state.position, camera.transform.position) > settings.cameraCutDistance ||
+            Quaternion.Angle(state.rotation, camera.transform.rotation) > settings.cameraCutAngle;
+
+        TextureHandle historyRead = renderGraph.ImportTexture(state.index == 0 ? state.a : state.b);
+        TextureHandle historyWrite = renderGraph.ImportTexture(state.index == 0 ? state.b : state.a);
+        // Consume the genuinely low-resolution rasterized color directly.
+        TextureHandle inputColor = resources.activeColorTexture;
+#if UNITY_EDITOR
+        if (reallocated || state.inputWidth != inputDesc.width || state.inputHeight != inputDesc.height)
+        {
+            var actualColor = renderGraph.GetTextureDesc(inputColor);
+            var actualDepth = renderGraph.GetTextureDesc(resources.cameraDepthTexture);
+            var actualMotion = renderGraph.GetTextureDesc(resources.motionVectorColor);
+            Debug.Log($"SGSR [{camera.name}]: color {actualColor.width}x{actualColor.height}, depth {actualDepth.width}x{actualDepth.height}, motion {actualMotion.width}x{actualMotion.height} -> output/history {outputDesc.width}x{outputDesc.height}", camera);
+        }
+#endif
+        TextureHandle previousMetadata = renderGraph.ImportTexture(state.index == 0 ? state.metadataA : state.metadataB);
+        TextureHandle motionDepthClip = renderGraph.ImportTexture(state.index == 0 ? state.metadataB : state.metadataA);
+
+        Vector4 renderSize = new(inputDesc.width, inputDesc.height, 1.0f / inputDesc.width, 1.0f / inputDesc.height);
+        Vector4 outputSize = new(outputDesc.width, outputDesc.height, 1.0f / outputDesc.width, 1.0f / outputDesc.height);
+        Vector2 jitter = jitterEnabled ? GetSampleDisplacement(cameraData, jitterComponent) : Vector2.zero;
+        Vector4 jitterPixels = new(jitter.x * inputDesc.width, jitter.y * inputDesc.height, 0, 0);
+        // Match SGSR2_Frag::Context::UpdateUniforms in Qualcomm's sample.
+        float areaRatio = (float)outputDesc.width * outputDesc.height / ((float)inputDesc.width * inputDesc.height);
+        Vector4 scaleRatio = new((float)outputDesc.width / inputDesc.width,
+            Mathf.Min(20.0f, Mathf.Pow(areaRatio, 3.0f)), 0, 0);
+        Matrix4x4 viewProjection = camera.projectionMatrix * camera.worldToCameraMatrix;
+        state.stillFrames = !reset && Approximately(state.viewProjection, viewProjection) ? state.stillFrames + 1 : 0;
+        float fov = Mathf.Abs(1.0f / camera.projectionMatrix.m00); // tan(horizontal FOV / 2)
+
+        using (var builder = renderGraph.AddRasterRenderPass<PassData>("SGSR Convert", out var data))
+        {
+            data.source = resources.activeColorTexture;
+            data.depth = resources.cameraDepthTexture; // Sampleable, resolved depth (not the MSAA attachment).
+            data.motion = resources.motionVectorColor;
+            data.material = settings.material;
+            data.passIndex = 0;
+            data.renderSize = renderSize;
+            data.fov = fov;
+            var depthDesc = renderGraph.GetTextureDesc(data.depth);
+            data.nativeDepthGather = depthDesc.width == inputDesc.width && depthDesc.height == inputDesc.height ? 1 : 0;
+            builder.UseTexture(data.source);
+            builder.UseTexture(data.depth);
+            builder.UseTexture(data.motion);
+            builder.SetRenderAttachment(motionDepthClip, 0, AccessFlags.WriteAll);
+            builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) => ExecutePass(d, ctx));
+        }
+        using (var builder = renderGraph.AddRasterRenderPass<PassData>("SGSR Upscale", out var data))
+        {
+            data.source = inputColor;
+            data.motionDepthClip = motionDepthClip;
+            data.history = historyRead;
+            data.depth = resources.cameraDepthTexture;
+            data.previousMetadata = previousMetadata;
+            data.previousJitter = state.jitter;
+            Matrix4x4 rasterProjection = cameraData.GetProjectionMatrix();
+            if (jitterEnabled) rasterProjection = jitterComponent.GetJitteredProjectionMatrix(rasterProjection);
+            data.inverseViewProjection = (GL.GetGPUProjectionMatrix(rasterProjection, true) * cameraData.GetViewMatrix()).inverse;
+            data.previousView = state.view;
+            data.historyDepthThreshold = Mathf.Clamp(settings.historyDepthThreshold, 0.001f, 0.1f);
+            data.material = settings.material;
+            data.passIndex = 1;
+            data.renderSize = renderSize;
+            data.outputSize = outputSize;
+            data.jitter = jitterPixels;
+            data.scaleRatio = scaleRatio;
+            data.minLerp = state.stillFrames > 5 ? Mathf.Clamp01(settings.minLerpContribution) : 0.0f;
+            data.reset = reset ? 1 : 0;
+            builder.UseTexture(inputColor);
+            builder.UseTexture(motionDepthClip);
+            builder.UseTexture(historyRead);
+            builder.UseTexture(data.depth);
+            builder.UseTexture(previousMetadata);
+            builder.SetRenderAttachment(historyWrite, 0, AccessFlags.WriteAll);
+            builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) => ExecutePass(d, ctx));
+        }
+        // Never copy back into the low-resolution scene target. A separate native
+        // color also protects history from later post effects or renderer features.
+        TextureHandle outputColor = UniversalRenderer.CreateRenderGraphTexture(renderGraph, outputDesc,
+            "_SGSR_OutputColor", false, FilterMode.Bilinear);
+        renderGraph.AddBlitPass(historyWrite, outputColor, Vector2.one, Vector2.zero,
+            passName: "SGSR Present");
+        resources.cameraColor = outputColor;
+        cameraData.cameraTargetDescriptor = outputDesc;
+        cameraData.renderScale = 1.0f;
+        cameraData.scaledWidth = outputDesc.width;
+        cameraData.scaledHeight = outputDesc.height;
+        // Like URP's own post-upscale resolution update, change globals at
+        // execution time, after all low-resolution scene draws have finished.
+        using (var builder = renderGraph.AddRasterRenderPass<ResolutionData>("SGSR Update Output Resolution", out var data))
+        {
+            data.screenSize = outputSize;
+            builder.AllowGlobalStateModification(true);
+            builder.AllowPassCulling(false);
+            builder.SetRenderFunc(static (ResolutionData d, RasterGraphContext ctx) =>
+            {
+                ctx.cmd.SetGlobalVector(ScreenSizeId, d.screenSize);
+                ctx.cmd.SetGlobalVector(ScaledScreenParamsId, new Vector4(d.screenSize.x, d.screenSize.y,
+                    1.0f + d.screenSize.z, 1.0f + d.screenSize.w));
+            });
+        }
+        state.valid = settings.enableHistory;
+        state.index = 1 - state.index;
+        state.lastFrame = Time.frameCount;
+        state.inputWidth = inputDesc.width;
+        state.inputHeight = inputDesc.height;
+        state.jitterConfiguration = jitterConfiguration;
+        state.projection = camera.projectionMatrix;
+        state.viewProjection = viewProjection;
+        state.position = camera.transform.position;
+        state.rotation = camera.transform.rotation;
+        state.view = cameraData.GetViewMatrix();
+        state.jitter = jitterPixels;
+    }
+
+    // Compute the actual raster UV displacement, including projection flipping.
+    // Motion vectors are non-jittered: history reprojection needs no jitter delta.
+    private static Vector2 GetSampleDisplacement(UniversalCameraData data, CameraJitter jitter)
+    {
+        Matrix4x4 projection = data.GetProjectionMatrix();
+        const bool flipped = true; // Same intermediate render target as the jitter pass.
+        Vector4 p = new(0, 0, -1, 1);
+        Vector4 original = GL.GetGPUProjectionMatrix(projection, flipped) * p;
+        Vector4 shifted = GL.GetGPUProjectionMatrix(jitter.GetJitteredProjectionMatrix(projection), flipped) * p;
+        Vector2 uv = new Vector2(shifted.x / shifted.w - original.x / original.w,
+            shifted.y / shifted.w - original.y / original.w) * 0.5f;
+        if (SystemInfo.graphicsUVStartsAtTop) uv.y = -uv.y;
+        return uv;
+    }
+
+    private static bool Approximately(Matrix4x4 a, Matrix4x4 b)
+    {
+        for (int i = 0; i < 16; ++i)
+            if (Mathf.Abs(a[i] - b[i]) > 1e-5f) return false;
+        return true;
+    }
+
+    public void ResetHistory(Camera camera = null)
+    {
+        if (camera != null)
+        {
+            if (histories.TryGetValue(camera, out var state)) state.valid = false;
+        }
+        else foreach (var state in histories.Values) state.valid = false;
+    }
+
+    private void PruneHistories()
+    {
+        expiredCameras.Clear();
+        foreach (var pair in histories)
+            if (pair.Key == null || Time.frameCount - pair.Value.lastFrame > 300) expiredCameras.Add(pair.Key);
+        foreach (Camera camera in expiredCameras)
+        {
+            histories[camera].Release();
+            histories.Remove(camera);
         }
     }
 
     public void Dispose()
     {
-        historyA?.Release();
-        historyB?.Release();
-        historyA = null;
-        historyB = null;
-        historyValid = false;
-    }
-
-    private bool EnsureHistory(ref RenderTextureDescriptor desc)
-    {
-        bool reallocatedA = RenderingUtils.ReAllocateHandleIfNeeded(
-            ref historyA,
-            desc,
-            FilterMode.Bilinear,
-            TextureWrapMode.Clamp,
-            name: "_SGSR_HistoryA"
-        );
-
-        bool reallocatedB = RenderingUtils.ReAllocateHandleIfNeeded(
-            ref historyB,
-            desc,
-            FilterMode.Bilinear,
-            TextureWrapMode.Clamp,
-            name: "_SGSR_HistoryB"
-        );
-
-        if (reallocatedA || reallocatedB)
-        {
-            historyValid = false;
-            historyIndex = 0;
-        }
-
-        return historyA != null && historyB != null;
-    }
-
-    private static Vector2 GetJitterDelta(Camera camera, SGSRSettings settings)
-    {
-        if (camera == null)
-            return Vector2.zero;
-
-        CameraJitter jitter = camera.GetComponent<CameraJitter>();
-        if (jitter == null || !jitter.enabled || settings == null || !settings.enableJitter || settings.jitterScale <= 0)
-            return Vector2.zero;
-
-        return jitter.CurrentJitterUV - jitter.PreviousJitterUV;
+        foreach (var state in histories.Values) state.Release();
+        histories.Clear();
     }
 }

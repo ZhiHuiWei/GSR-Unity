@@ -7,7 +7,7 @@
 
 在 AddRenderPasses 中、URP 创建相机附件之前，将场景渲染描述符改为原生输出尺寸乘 SGSR Render Scale。颜色、深度、motion vector 直接在该分辨率生成；jitter 按该分辨率的像素计算。
 
-1. **SGSR Convert**：读取低分辨率 cameraDepthTexture 和 motionVectorColor，输出 RGBA32F MotionDepthClip（RG = Unity UV motion，B = depth clip，A = 线性 eye depth），按相机双缓冲保存供下一帧遮挡检测。不再缩小或复制颜色。
+1. **SGSR Convert**：读取低分辨率 cameraDepthTexture 和 motionVectorColor，输出临时 RGBA16F MotionDepthClip（RG = Unity UV motion，B = depth clip，A = 0）。不再缩小或复制颜色。
 2. **SGSR Upscale**：使用当前 jitter、五点 FastLanczos、加权颜色方差包围盒和历史裁剪，直接读取低分辨率场景颜色，重建到原生输出大小，直接写入下一帧的历史纹理。
 3. **SGSR Present**：URP 内置 blit 将历史输出复制到独立的全分辨率颜色纹理，再将其设置为 resources.cameraColor。随后恢复 cameraTargetDescriptor、renderScale 和屏幕尺寸常量，后续后处理与最终显示使用全分辨率；不会再写回低分辨率目标。这只是集成所需的复制，不是第三段 SGSR 算法；shader 本身只有 Convert、Upscale 两个 pass。
 
@@ -50,7 +50,9 @@
 
 Play Mode 下另读取连续 8 帧，确认运动向量非零、历史没有逐帧重置，运动球体和旋转方块正常显示；Console 无 warning/error。C# 和两个 shader pass 的离线编译通过。棋盘和细线材质使用未预过滤的 floor/step 高频图案，远处仍可出现摩尔纹；SGSR 的时域融合不能保证完全消除超过采样能力的细节混叠。
 
-## 不透明物体拖影修正（尚未运行验证）
+## 不透明物体拖影修正记录（深度硬拒绝已撤回）
+
+2026-09-21：下述 eye-depth 硬拒绝已撤回，相关 metadata 双缓冲、矩阵、上一帧 jitter 参数和 History Depth Threshold 均已移除。Convert 当前使用单张临时 RGBA16F 纹理，A=0，不再记录 eye depth。YCoCg 裁剪、motion 单位转换及原有历史重置逻辑保留。此次仅做文件修改及静态检查，未操作 Unity、未编译或运行验证。以下内容保留为之前的改动记录。
 
 本次在官方 2-pass-FS 基础上增加历史拒绝，仍为 Convert + Upscale 两个算法 pass：
 

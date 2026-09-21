@@ -76,6 +76,5 @@ MonoBehaviour:
     jitterScale: 1
     jitterPhaseCount: 8
     minLerpContribution: 0.3
-    historyDepthThreshold: 0.02
     cameraCutDistance: 5
     cameraCutAngle: 45

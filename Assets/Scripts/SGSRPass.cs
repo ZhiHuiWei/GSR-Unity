@@ -16,11 +16,6 @@ public class SGSRPass : ScriptableRenderPass
     private static readonly int MotionId = Shader.PropertyToID("_MotionVectorTexture");
     private static readonly int MotionDepthClipId = Shader.PropertyToID("_SGSRMotionDepthClipTexture");
     private static readonly int HistoryId = Shader.PropertyToID("_SGSRHistoryTexture");
-    private static readonly int PreviousMetadataId = Shader.PropertyToID("_SGSRPreviousMetadata");
-    private static readonly int PreviousJitterId = Shader.PropertyToID("_SGSRPreviousJitter");
-    private static readonly int InverseViewProjectionId = Shader.PropertyToID("_SGSRInverseViewProjection");
-    private static readonly int PreviousViewId = Shader.PropertyToID("_SGSRPreviousView");
-    private static readonly int DepthThresholdId = Shader.PropertyToID("_SGSRHistoryDepthThreshold");
     private static readonly int RenderSizeId = Shader.PropertyToID("_SGSRRenderSize");
     private static readonly int OutputSizeId = Shader.PropertyToID("_SGSROutputSize");
     private static readonly int JitterId = Shader.PropertyToID("_SGSRJitter");
@@ -44,8 +39,6 @@ public class SGSRPass : ScriptableRenderPass
         [Range(1, 32)] public int jitterPhaseCount = 8;
         [Tooltip("History relaxation after the camera has been stationary for more than five frames.")]
         [Range(0.0f, 1.0f)] public float minLerpContribution = 0.3f;
-        [Tooltip("Relative eye-depth tolerance for history rejection. Smaller values reject more history at occlusion boundaries.")]
-        [Range(0.001f, 0.1f)] public float historyDepthThreshold = 0.02f;
         [Min(0.01f)] public float cameraCutDistance = 5.0f;
         [Range(1, 180)] public float cameraCutAngle = 45.0f;
     }
@@ -53,9 +46,6 @@ public class SGSRPass : ScriptableRenderPass
     private sealed class CameraHistory
     {
         public RTHandle a, b;
-        public RTHandle metadataA, metadataB;
-        public Vector4 jitter;
-        public Matrix4x4 view;
         public bool valid;
         public int index, lastFrame = -1, inputWidth, inputHeight, jitterConfiguration, stillFrames;
         public Matrix4x4 viewProjection;
@@ -65,8 +55,8 @@ public class SGSRPass : ScriptableRenderPass
         public Quaternion rotation;
         public void Release()
         {
-            a?.Release(); b?.Release(); metadataA?.Release(); metadataB?.Release();
-            a = b = metadataA = metadataB = null;
+            a?.Release(); b?.Release();
+            a = b = null;
             valid = false;
         }
     }
@@ -105,10 +95,6 @@ public class SGSRPass : ScriptableRenderPass
     private class PassData
     {
         public TextureHandle source, depth, motion, motionDepthClip, history;
-        public TextureHandle previousMetadata;
-        public Vector4 previousJitter;
-        public Matrix4x4 inverseViewProjection, previousView;
-        public float historyDepthThreshold;
         public Material material;
         public int passIndex;
         public Vector4 renderSize, outputSize, jitter, scaleRatio;
@@ -141,12 +127,6 @@ public class SGSRPass : ScriptableRenderPass
         {
             material.SetTexture(MotionDepthClipId, data.motionDepthClip);
             material.SetTexture(HistoryId, data.history);
-            material.SetTexture(DepthId, data.depth);
-            material.SetTexture(PreviousMetadataId, data.previousMetadata);
-            material.SetVector(PreviousJitterId, data.previousJitter);
-            material.SetMatrix(InverseViewProjectionId, data.inverseViewProjection);
-            material.SetMatrix(PreviousViewId, data.previousView);
-            material.SetFloat(DepthThresholdId, data.historyDepthThreshold);
         }
         material.SetTexture(BlitTextureId, data.source);
         material.SetVector(BlitScaleBiasId, new Vector4(1, 1, 0, 0));
@@ -183,17 +163,6 @@ public class SGSRPass : ScriptableRenderPass
         reallocated |= RenderingUtils.ReAllocateHandleIfNeeded(ref state.b, outputDesc, FilterMode.Bilinear,
             TextureWrapMode.Clamp, name: "_SGSR_HistoryB");
 
-        // Keep Convert's low-resolution metadata alongside the matching color history.
-        // Alpha stores eye depth, so no additional shader pass is needed.
-        var metadataDesc = outputDesc;
-        metadataDesc.width = inputDesc.width;
-        metadataDesc.height = inputDesc.height;
-        metadataDesc.graphicsFormat = GraphicsFormat.R32G32B32A32_SFloat;
-        reallocated |= RenderingUtils.ReAllocateHandleIfNeeded(ref state.metadataA, metadataDesc,
-            FilterMode.Point, TextureWrapMode.Clamp, name: "_SGSR_MetadataA");
-        reallocated |= RenderingUtils.ReAllocateHandleIfNeeded(ref state.metadataB, metadataDesc,
-            FilterMode.Point, TextureWrapMode.Clamp, name: "_SGSR_MetadataB");
-
         CameraJitter jitterComponent = camera.GetComponent<CameraJitter>();
         bool jitterEnabled = settings.enableJitter && settings.jitterScale > 0 &&
             jitterComponent != null && jitterComponent.isActiveAndEnabled;
@@ -218,8 +187,12 @@ public class SGSRPass : ScriptableRenderPass
             Debug.Log($"SGSR [{camera.name}]: color {actualColor.width}x{actualColor.height}, depth {actualDepth.width}x{actualDepth.height}, motion {actualMotion.width}x{actualMotion.height} -> output/history {outputDesc.width}x{outputDesc.height}", camera);
         }
 #endif
-        TextureHandle previousMetadata = renderGraph.ImportTexture(state.index == 0 ? state.metadataA : state.metadataB);
-        TextureHandle motionDepthClip = renderGraph.ImportTexture(state.index == 0 ? state.metadataB : state.metadataA);
+        RenderTextureDescriptor motionDesc = outputDesc;
+        motionDesc.width = inputDesc.width;
+        motionDesc.height = inputDesc.height;
+        motionDesc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
+        TextureHandle motionDepthClip = UniversalRenderer.CreateRenderGraphTexture(renderGraph, motionDesc,
+            "_SGSR_MotionDepthClip", false, FilterMode.Point);
 
         Vector4 renderSize = new(inputDesc.width, inputDesc.height, 1.0f / inputDesc.width, 1.0f / inputDesc.height);
         Vector4 outputSize = new(outputDesc.width, outputDesc.height, 1.0f / outputDesc.width, 1.0f / outputDesc.height);
@@ -255,14 +228,6 @@ public class SGSRPass : ScriptableRenderPass
             data.source = inputColor;
             data.motionDepthClip = motionDepthClip;
             data.history = historyRead;
-            data.depth = resources.cameraDepthTexture;
-            data.previousMetadata = previousMetadata;
-            data.previousJitter = state.jitter;
-            Matrix4x4 rasterProjection = cameraData.GetProjectionMatrix();
-            if (jitterEnabled) rasterProjection = jitterComponent.GetJitteredProjectionMatrix(rasterProjection);
-            data.inverseViewProjection = (GL.GetGPUProjectionMatrix(rasterProjection, true) * cameraData.GetViewMatrix()).inverse;
-            data.previousView = state.view;
-            data.historyDepthThreshold = Mathf.Clamp(settings.historyDepthThreshold, 0.001f, 0.1f);
             data.material = settings.material;
             data.passIndex = 1;
             data.renderSize = renderSize;
@@ -274,8 +239,6 @@ public class SGSRPass : ScriptableRenderPass
             builder.UseTexture(inputColor);
             builder.UseTexture(motionDepthClip);
             builder.UseTexture(historyRead);
-            builder.UseTexture(data.depth);
-            builder.UseTexture(previousMetadata);
             builder.SetRenderAttachment(historyWrite, 0, AccessFlags.WriteAll);
             builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) => ExecutePass(d, ctx));
         }
@@ -314,8 +277,6 @@ public class SGSRPass : ScriptableRenderPass
         state.viewProjection = viewProjection;
         state.position = camera.transform.position;
         state.rotation = camera.transform.rotation;
-        state.view = cameraData.GetViewMatrix();
-        state.jitter = jitterPixels;
     }
 
     // Compute the actual raster UV displacement, including projection flipping.

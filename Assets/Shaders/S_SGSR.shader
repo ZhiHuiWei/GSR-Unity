@@ -17,11 +17,6 @@ Shader "Custom/S_SGSR"
         TEXTURE2D_X(_MotionVectorTexture);
         TEXTURE2D_X(_SGSRMotionDepthClipTexture);
         TEXTURE2D_X(_SGSRHistoryTexture);
-        TEXTURE2D_X_FLOAT(_SGSRPreviousMetadata);
-        float4 _SGSRPreviousJitter;
-        float4x4 _SGSRInverseViewProjection;
-        float4x4 _SGSRPreviousView;
-        float _SGSRHistoryDepthThreshold;
         float4 _SGSRRenderSize; // xy: size, zw: reciprocal size
         float4 _SGSROutputSize;
         float4 _SGSRJitter; // xy: current sample displacement in input pixels
@@ -83,16 +78,6 @@ Shader "Custom/S_SGSR"
             return float3(color.x + color.y - color.z, color.x + color.z,
                           color.x - color.y - color.z);
         }
-        float InputEyeDepth(float nearZeroDepth)
-        {
-            if (unity_OrthoParams.w > 0.5)
-                return lerp(_ProjectionParams.y, _ProjectionParams.z, nearZeroDepth);
-            #if UNITY_REVERSED_Z
-                return LinearEyeDepth(1.0 - nearZeroDepth, _ZBufferParams);
-            #else
-                return LinearEyeDepth(nearZeroDepth, _ZBufferParams);
-            #endif
-        }
         ENDHLSL
 
         Pass
@@ -123,7 +108,7 @@ Shader "Custom/S_SGSR"
                 // URP supplies signed current-minus-previous UV motion, including
                 // camera motion. Zero and negative values are valid; no decoding.
                 float2 motion = SAMPLE_TEXTURE2D_X_LOD(_MotionVectorTexture, sampler_PointClamp, uv, 0).xy;
-                return float4(motion, depthclip, InputEyeDepth(LoadInputDepth(p)));
+                return float4(motion, depthclip, 0.0);
             }
             ENDHLSL
         }
@@ -143,34 +128,6 @@ Shader "Custom/S_SGSR"
                 float3 mda = SAMPLE_TEXTURE2D_X_LOD(_SGSRMotionDepthClipTexture, sampler_PointClamp, jitteruv, 0).xyz;
                 float2 prevUV = hruv - mda.xy;
                 bool reset = _SGSRReset > 0.5 || any(prevUV < 0.0) || any(prevUV > 1.0);
-                // Color history is unjittered, but previous Convert metadata is
-                // on the previous jittered raster grid. Reject newly exposed surfaces.
-                UNITY_BRANCH
-                if (!reset)
-                {
-                    float2 previousRasterUV = prevUV + _SGSRPreviousJitter.xy * _SGSRRenderSize.zw;
-                    if (any(previousRasterUV < 0.0) || any(previousRasterUV > 1.0))
-                        reset = true;
-                    else
-                    {
-                        float previousEyeDepth = SAMPLE_TEXTURE2D_X_LOD(_SGSRPreviousMetadata,
-                            sampler_PointClamp, previousRasterUV, 0).w;
-                        float rawDepth = LoadInputDepth(inputPos);
-                        #if UNITY_REVERSED_Z
-                            rawDepth = 1.0 - rawDepth;
-                        #else
-                            rawDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1.0, rawDepth);
-                        #endif
-                        float2 sampleUV = (float2(inputPos) + 0.5) * _SGSRRenderSize.zw;
-                        float3 positionWS = ComputeWorldSpacePosition(sampleUV, rawDepth, _SGSRInverseViewProjection);
-                        float expectedPreviousDepth = -mul(_SGSRPreviousView, float4(positionWS, 1.0)).z;
-                        float tolerance = max(0.01, abs(expectedPreviousDepth) * _SGSRHistoryDepthThreshold);
-                        // UV motion has no object Z displacement. Significant motion
-                        // in depth conservatively rejects history instead of ghosting.
-                        reset = expectedPreviousDepth <= 0.0 ||
-                            abs(previousEyeDepth - expectedPreviousDepth) > tolerance;
-                    }
-                }
                 float3 historyColor = 0.0;
                 UNITY_BRANCH
                 if (!reset)

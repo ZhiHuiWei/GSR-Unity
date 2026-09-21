@@ -69,12 +69,15 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SGSR
   m_Active: 1
   settings:
-    renderScale: 1
+    algorithm: 1
+    computeShader: {fileID: 7200000, guid: 743bd3d2c73a4ca2af05a8b423b9e751, type: 3}
+    preExposure: 1
+    renderScale: 0.503
     material: {fileID: 2100000, guid: 4c3306a42d9b2aa4f9f643dba3e87385, type: 2}
     enableHistory: 1
     enableJitter: 1
     jitterScale: 1
-    jitterPhaseCount: 8
+    jitterPhaseCount: 5
     minLerpContribution: 0.3
-    cameraCutDistance: 5
-    cameraCutAngle: 45
+    cameraCutDistance: 55
+    cameraCutAngle: 81

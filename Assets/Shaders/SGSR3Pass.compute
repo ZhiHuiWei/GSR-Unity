@@ -1,0 +1,227 @@
+// Unity port of the supplied sgsr2_convert/activate/upscale.comp (3-pass-CS).
+// Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+#pragma kernel Convert
+#pragma kernel Activate
+#pragma kernel Upscale
+
+Texture2D<float4> _InputOpaqueColor;
+Texture2D<float4> _InputColor;
+Texture2D<float> _InputDepth;
+Texture2D<float2> _InputVelocity;
+Texture2D<uint> _ColorLuma;
+Texture2D<float4> _MotionDepthAlpha;
+Texture2D<float4> _MotionDepthClipAlpha;
+Texture2D<uint> _PreviousLuma;
+Texture2D<float4> _PreviousHistory;
+RWTexture2D<uint> _ColorLumaOut;
+RWTexture2D<float4> _MotionDepthAlphaOut;
+RWTexture2D<float4> _MotionDepthClipAlphaOut;
+RWTexture2D<uint> _LumaOut;
+RWTexture2D<float4> _HistoryOut;
+RWTexture2D<float4> _SceneOut;
+SamplerState sampler_LinearClamp;
+SamplerState sampler_PointClamp;
+
+float4 _RenderSize; // xy dimensions, zw reciprocals
+float4 _OutputSize;
+float4 _Jitter; // xy current, zw previous; input-pixel raster displacements
+float _PreExposure; // matched forward/inverse color compression parameter
+float _CameraFov;
+int _Reset;
+int _ReversedZ;
+static const float EPSILON = 1.192e-7;
+
+int2 ClampInput(int2 p) { return clamp(p, int2(0, 0), int2(_RenderSize.xy) - 1); }
+float Nearer(float a, float b) { return _ReversedZ != 0 ? max(a, b) : min(a, b); }
+float FarDistanceFactor(float depth) { return _ReversedZ != 0 ? depth : 1.0 - depth; }
+bool Inside(float2 uv) { return all(uv >= 0.0) && all(uv <= 1.0); }
+
+float3 CompressColor(float3 color)
+{
+    color = max(color, 0.0);
+    return color / (max(color.r, max(color.g, color.b)) + _PreExposure);
+}
+uint PackColor(float3 rgb)
+{
+    float y = dot(rgb, float3(0.25, 0.5, 0.25));
+    float co = saturate(0.5 * rgb.r + 0.5 - 0.5 * rgb.b);
+    float cg = saturate(y + co - rgb.r);
+    return (uint(y * 2047.5) << 21u) | (uint(co * 2047.5) << 10u) | uint(cg * 1023.5);
+}
+float3 DecodeColor(uint packed)
+{
+    return float3(float(packed >> 21u) / 2047.5,
+                  float((packed >> 10u) & 2047u) / 2047.5 - 0.5,
+                  float(packed & 1023u) / 1023.5 - 0.5);
+}
+float FastLanczos(float value)
+{
+    float y = value - 1.0;
+    float y2 = y * y;
+    return (0.75 * y + y2) * y2;
+}
+
+[numthreads(8, 8, 1)]
+void Convert(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_RenderSize.xy)) return;
+    int2 p = int2(id.xy);
+    float nearestDepth = _ReversedZ != 0 ? 0.0 : 1.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    [unroll] for (int x = -1; x <= 1; ++x)
+    {
+        float2 uv = (float2(ClampInput(p + int2(x, y))) + 0.5) * _RenderSize.zw;
+        nearestDepth = Nearer(nearestDepth, _InputDepth.SampleLevel(sampler_PointClamp, uv, 0));
+    }
+    float2 sampleUV = (float2(p) + 0.5) * _RenderSize.zw;
+    // URP already provides object + camera motion in signed UV units. Do not
+    // decode it, test its sign, or synthesize camera motion from zero velocity.
+    float2 motion = _InputVelocity.SampleLevel(sampler_PointClamp, sampleUV, 0);
+    float3 color = CompressColor(_InputColor.Load(int3(p, 0)).rgb);
+    float3 opaque = CompressColor(_InputOpaqueColor.Load(int3(p, 0)).rgb);
+    float3 delta = abs(color - opaque);
+    float alphaMask = 350.0 * max(delta.r, max(delta.g, delta.b));
+    _ColorLumaOut[p] = PackColor(color);
+    // Keep native reversed depth to avoid rounding near-1 depth to 1 in RGBA16F.
+    _MotionDepthAlphaOut[p] = float4(motion, nearestDepth, alphaMask);
+}
+
+// Explicit loads reproduce GLSL gather order and clamp its footprint at edges.
+float4 GatherCurrentDepth(float2 uv, int2 offset)
+{
+    int2 p = int2(floor(uv * _RenderSize.xy - 0.5)) + offset;
+    return float4(_MotionDepthAlpha.Load(int3(ClampInput(p + int2(0, 1)), 0)).z,
+                  _MotionDepthAlpha.Load(int3(ClampInput(p + int2(1, 1)), 0)).z,
+                  _MotionDepthAlpha.Load(int3(ClampInput(p + int2(1, 0)), 0)).z,
+                  _MotionDepthAlpha.Load(int3(ClampInput(p), 0)).z);
+}
+float DepthAgreement(float a, float b)
+{
+    float separation = 1.37e-5 * _CameraFov * length(_RenderSize.xy) * FarDistanceFactor(Nearer(a, b));
+    return saturate(separation / (abs(a - b) + EPSILON));
+}
+
+[numthreads(8, 8, 1)]
+void Activate(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_RenderSize.xy)) return;
+    int2 p = int2(id.xy);
+    float2 uv = (float2(p) + 0.5) * _RenderSize.zw;
+    float4 mda = _MotionDepthAlpha.Load(int3(p, 0));
+    float2 prevUV = uv - mda.xy;
+    float depthclip = 0.0;
+    if (FarDistanceFactor(mda.z) > 1.0e-5)
+    {
+        float2 fraction = frac(prevUV * _RenderSize.xy - 0.5);
+        float weights[4] = {
+            (1.0 - fraction.x) * (1.0 - fraction.y), fraction.x * (1.0 - fraction.y),
+            (1.0 - fraction.x) * fraction.y, fraction.x * fraction.y
+        };
+        const int2 offsets[4] = { int2(-1, -1), int2(-1, 0), int2(0, -1), int2(0, 0) };
+        float agreement = 0.0;
+        [unroll] for (int i = 0; i < 4; i += 2)
+        {
+            // The supplied Activate shader samples CURRENT metadata at PrevUV;
+            // this is not a previous-frame eye-depth comparison or hard reset.
+            float4 depths = GatherCurrentDepth(prevUV, offsets[i]);
+            float bottom = Nearer(depths.z, depths.w);
+            float nearest = Nearer(Nearer(depths.x, depths.y), bottom);
+            agreement += DepthAgreement(nearest, mda.z) * weights[i];
+            float2 more = GatherCurrentDepth(prevUV, offsets[i + 1]).zw;
+            nearest = Nearer(Nearer(more.x, more.y), bottom);
+            agreement += DepthAgreement(nearest, mda.z) * weights[i + 1];
+        }
+        depthclip = saturate(1.0 - agreement);
+    }
+
+    float luma = DecodeColor(_ColorLuma.Load(int3(p, 0))).x;
+    // Luma history is on the low-resolution jittered grid; color history below
+    // is on the unjittered output grid. Only the former needs this jitter delta.
+    float2 previousLumaUV = prevUV + (_Jitter.zw - _Jitter.xy) * _RenderSize.zw;
+    float2 currentLumaDiff = 0.0;
+    float lumaDiff = luma;
+    if (_Reset == 0 && depthclip < 0.1 && Inside(previousLumaUV))
+    {
+        // Equivalent to textureGather(...).w, rather than bilinear filtering uints.
+        int2 previousPos = ClampInput(int2(floor(previousLumaUV * _RenderSize.xy - 0.5)));
+        uint packed = _PreviousLuma.Load(int3(previousPos, 0));
+        float2 previous = float2(f16tof32(packed >> 16u), f16tof32(packed & 0xffffu));
+        lumaDiff = luma - previous.x;
+        currentLumaDiff.x = luma;
+        currentLumaDiff.y = previous.y != 0.0 ?
+            (sign(lumaDiff) == sign(previous.y) ? sign(lumaDiff) * min(abs(previous.y), abs(lumaDiff)) : previous.y) : lumaDiff;
+    }
+    float historyFlag = currentLumaDiff.x != 0.0 && abs(currentLumaDiff.y) != abs(lumaDiff) ? 0.5 : 0.0;
+    _LumaOut[p] = (f32tof16(currentLumaDiff.x) << 16u) | f32tof16(currentLumaDiff.y);
+    _MotionDepthClipAlphaOut[p] = float4(mda.xy, depthclip, floor(mda.w) + historyFlag);
+}
+
+[numthreads(8, 8, 1)]
+void Upscale(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_OutputSize.xy)) return;
+    float2 uv = (float2(id.xy) + 0.5) * _OutputSize.zw;
+    float2 jitterUV = saturate(uv + _Jitter.xy * _RenderSize.zw);
+    int2 p = ClampInput(int2(jitterUV * _RenderSize.xy));
+    float4 mda = _MotionDepthClipAlpha.Load(int3(p, 0));
+    float2 prevUV = uv - mda.xy;
+    bool reset = _Reset != 0 || !Inside(prevUV);
+    float4 history = 0.0;
+    if (!reset) history = _PreviousHistory.SampleLevel(sampler_LinearClamp, prevUV, 0);
+    float historyValue = frac(mda.w) * 2.0;
+    float alphaMask = floor(mda.w) * 0.001;
+    float wFactor = max(saturate(abs(history.w)), alphaMask);
+    float kernelFactor = saturate(wFactor + (reset ? 1.0 : 0.0));
+    float scale = min(_OutputSize.x / _RenderSize.x, 1.99);
+    float biasMax = scale * (1.0 - kernelFactor);
+    float biasMin = max(1.0, 0.3 + 0.3 * biasMax);
+    float kernelBias = 0.5 * lerp(biasMax, biasMin, max(0.25 * mda.z, kernelFactor));
+    float motionLength = length(2.0 * mda.xy * _OutputSize.xy);
+    float curveBias = lerp(-2.0, -3.0, saturate(motionLength * 0.02));
+    float2 sourceOffset = float2(p) + 0.5 - _Jitter.xy - uv * _RenderSize.xy;
+    float4 current = 0.0;
+    float3 boxMin = 1.0e20, boxMax = -1.0e20, mean = 0.0, variance = 0.0;
+    float boxWeight = 0.0;
+    // Same nine texels as the official gathers, ordered explicitly.
+    const int2 offsets[9] = { int2(1, 1), int2(-1, 1), int2(0, 1),
+        int2(1, 0), int2(1, -1), int2(-1, 0), int2(0, 0), int2(0, -1), int2(-1, -1) };
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        float3 color = DecodeColor(_ColorLuma.Load(int3(ClampInput(p + offsets[i]), 0)));
+        float2 offset = sourceOffset + offsets[i];
+        float distance2 = dot(offset, offset);
+        float weight = FastLanczos(saturate(distance2 * kernelBias * kernelBias));
+        current += float4(color * weight, weight);
+        float bw = exp(distance2 * curveBias);
+        boxMin = min(boxMin, color); boxMax = max(boxMax, color);
+        mean += color * bw; variance += color * color * bw; boxWeight += bw;
+    }
+    mean /= max(boxWeight, EPSILON);
+    variance = sqrt(abs(variance / max(boxWeight, EPSILON) - mean * mean));
+    // Preserve signed Lanczos weights. Guard only a zero denominator.
+    if (abs(current.w) <= EPSILON)
+        current = float4(DecodeColor(_ColorLuma.Load(int3(p, 0))), 1.0);
+    current.xyz = clamp(current.xyz / current.w, boxMin - 0.05, boxMax + 0.05);
+    current.w *= 1.0 / 3.0;
+    float contribution = historyValue * saturate(variance.x * 10.0) * (1.0 - wFactor);
+    float baseUpdate = (1.0 - wFactor) * (1.0 - mda.z);
+    baseUpdate = min(baseUpdate, lerp(baseUpdate, current.w * 10.0, saturate(10.0 * motionLength)));
+    baseUpdate = min(baseUpdate, lerp(baseUpdate, current.w, saturate(motionLength * 0.05)));
+    float areaRatio = (_OutputSize.x / _RenderSize.x) * (_OutputSize.y / _RenderSize.y);
+    float boxSize = lerp(min(20.0, pow(areaRatio, 3.0)), 1.0, max(mda.z, saturate(motionLength * 0.05)));
+    boxMin = max(boxMin, mean - variance * boxSize);
+    boxMax = min(boxMax, mean + variance * boxSize);
+    float3 clampedHistory = clamp(history.xyz, boxMin, boxMax);
+    float relaxation = any(history.xyz < boxMin) || any(history.xyz > boxMax) ? contribution : 1.0;
+    relaxation *= 1.0 - sqrt(alphaMask);
+    history.xyz = lerp(clampedHistory, history.xyz, saturate(relaxation));
+    float baseAlpha = lerp(min(baseUpdate, 0.1), baseUpdate, saturate(relaxation));
+    float alpha = reset ? 1.0 : saturate(current.w / max(EPSILON, baseAlpha + current.w));
+    float3 result = lerp(history.xyz, current.xyz, alpha);
+    _HistoryOut[id.xy] = float4(result, wFactor); // compressed YCoCg + state, NOT display RGBA
+    float3 rgb = float3(result.x - result.z + result.y, result.x + result.z, result.x - result.z - result.y);
+    rgb *= _PreExposure / max(EPSILON, (1.0 + 1.0 / 65504.0) - max(rgb.r, max(rgb.g, rgb.b)));
+    // Preserve scene alpha separately; the official SceneColorOutput.w is a filter weight.
+    _SceneOut[id.xy] = float4(rgb, _InputColor.Load(int3(p, 0)).a);
+}

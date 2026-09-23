@@ -149,6 +149,10 @@ Shader "Custom/S_SGSR"
                 float3 boxmax = -1.0e20;
                 // Official fast path: top, right, left, center, bottom (five taps).
                 const int2 offsets[5] = { int2(0, 1), int2(1, 0), int2(-1, 0), int2(0, 0), int2(0, -1) };
+                
+                float sumWeight = 0.0;
+                float absWeight = 0.0;
+                float negativeWeight = 0.0;
                 [unroll]
                 for (int i = 0; i < 5; ++i)
                 {
@@ -165,7 +169,15 @@ Shader "Custom/S_SGSR"
                     boxcenter += color * bw;
                     boxvar += color * color * bw;
                     boxweight += bw;
+                    
+                    sumWeight += weight;
+                    absWeight += abs(weight);
+                    negativeWeight += min(weight, 0.0);
                 }
+                
+                float cancellation = 1.0 - saturate(abs(sumWeight) / max(absWeight, 1.0e-6));
+                float negativeFraction = saturate(-negativeWeight /  max(absWeight, 1.0e-6));
+                return float4(negativeFraction, 0,0,1);
                 boxcenter /= max(boxweight, 1.192e-7);
                 boxvar = sqrt(abs(boxvar / max(boxweight, 1.192e-7) - boxcenter * boxcenter));
                 // Negative Lanczos lobes are intentional in the official filter.
